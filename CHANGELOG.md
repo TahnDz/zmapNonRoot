@@ -2,10 +2,12 @@
 ## BUGFIX
 * Reworked unprivileged `tcp_synscan` to use asynchronous nonblocking TCP connects instead of one blocking connect per target, which restores practical send rates for non-root Linux and Termux runs.
 * Stopped launching new unprivileged TCP probes after `--max-runtime` expires while still draining in-flight sockets, and fixed sender completion so `--unprivileged` scans exit cleanly after reporting progress/results.
+* Smoothed unprivileged `tcp_synscan` pacing by capping connect-based rate to the practical inflight window and launching probes in short slices instead of timeout-sized bursts.
 
 ## FEATURE
 * Added an unprivileged Linux backend that falls back from raw sockets to ordinary TCP/UDP sockets for compatible probe modules.
 * Added `--unprivileged` and automatic fallback behavior for non-root environments such as Termux when raw sockets are unavailable.
+* Added `scripts/bootstrap-env.sh`, `scripts/build.sh`, and `scripts/install-local.sh` for user-local builds on Termux and other non-root Linux environments without assuming `sudo` or `apt`.
 
 ## NOTES
 * The unprivileged backend keeps ZMap's iteration, sharding, filtering, and output pipeline, but it does not preserve every raw-packet or libpcap behavior.

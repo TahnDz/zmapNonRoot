@@ -1,5 +1,5 @@
 set(GIT_CMD "git")
-set(GIT_ARGS "log" "-n" "1" "--pretty=format:%h - %ad")
+set(GIT_ARGS "-C" "${ORIG_SRC_DIR}" "log" "-n" "1" "--pretty=format:%h - %ad")
 execute_process(COMMAND ${GIT_CMD} ${GIT_ARGS}
     RESULT_VARIABLE GIT_RESULT
     OUTPUT_VARIABLE GIT_COMMIT)

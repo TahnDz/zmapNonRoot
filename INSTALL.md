@@ -82,6 +82,33 @@ Then, ZMap can be compiled by running:
 
 and then installed via `sudo make install`.
 
+For a user-local build that does not assume `sudo`, `apt`, or any system-wide
+install location, use the helper scripts in `scripts/`:
+
+```sh
+sh scripts/bootstrap-env.sh
+sh scripts/build.sh
+sh scripts/install-local.sh
+```
+
+By default these build in `$HOME/build-zmap`, install into `$HOME/.local/zmap`,
+and also search `$HOME/.local` for locally installed headers, libraries,
+pkg-config files, and tools. You can override the paths with:
+
+```sh
+ZMAP_DEPS_PREFIX=$HOME/.local \
+ZMAP_BUILD_DIR=$HOME/build-zmap \
+ZMAP_INSTALL_PREFIX=$HOME/.local/zmap \
+sh scripts/build.sh
+
+ZMAP_BUILD_DIR=$HOME/build-zmap \
+ZMAP_INSTALL_PREFIX=$HOME/.local/zmap \
+sh scripts/install-local.sh
+```
+
+This flow is intended for Termux and other non-root Linux environments where
+dependencies are already available under a user-owned prefix.
+
 ### Running without root on Linux or Termux
 
 When raw sockets are unavailable, ZMap will automatically fall back to `--unprivileged` for compatible probe modules. You can also request that path explicitly:

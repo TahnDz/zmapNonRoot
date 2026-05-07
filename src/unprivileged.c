@@ -33,6 +33,9 @@
 #include "validate.h"
 
 #define UNPRIVILEGED_TIMEOUT_MS 1000
+#define TCP_CONNECT_PACING_SLICE_MS 10
+#define TCP_CONNECT_MAX_LAUNCH_BATCH 256
+#define TCP_CONNECT_MAX_RATE_LAG_PACKETS 32.0
 
 typedef enum {
 	UNPRIV_BACKEND_UNSUPPORTED = 0,
@@ -283,6 +286,35 @@ static int get_tcp_max_inflight(void)
 	return (int)per_thread;
 }
 
+static double get_tcp_effective_rate(double send_rate, int max_inflight)
+{
+	double max_rate = ((double)max_inflight * 1000.0) /
+			  (double)UNPRIVILEGED_TIMEOUT_MS;
+	if (max_rate < 1.0) {
+		max_rate = 1.0;
+	}
+	if (send_rate <= 0.0 || send_rate > max_rate) {
+		return max_rate;
+	}
+	return send_rate;
+}
+
+static int get_tcp_launch_batch_cap(double send_rate)
+{
+	double batch = send_rate * ((double)TCP_CONNECT_PACING_SLICE_MS / 1000.0);
+	int cap = (int)batch;
+	if ((double)cap < batch) {
+		cap++;
+	}
+	if (cap < 1) {
+		cap = 1;
+	}
+	if (cap > TCP_CONNECT_MAX_LAUNCH_BATCH) {
+		cap = TCP_CONNECT_MAX_LAUNCH_BATCH;
+	}
+	return cap;
+}
+
 static int time_until_next_send_ms(double next_send_at)
 {
 	double now_time = steady_now();
@@ -345,16 +377,22 @@ static int tcp_launch_rate_ready(double *next_send_at, double send_rate)
 		return 1;
 	}
 	double now_time = steady_now();
+	double max_lag = (double)TCP_CONNECT_PACING_SLICE_MS / 1000.0;
+	double lag_for_packets =
+	    TCP_CONNECT_MAX_RATE_LAG_PACKETS / send_rate;
+	if (lag_for_packets > max_lag) {
+		max_lag = lag_for_packets;
+	}
 	if (*next_send_at <= 0.0) {
+		*next_send_at = now_time;
+	}
+	if (*next_send_at + max_lag < now_time) {
 		*next_send_at = now_time;
 	}
 	if (now_time + 0.000001 < *next_send_at) {
 		return 0;
 	}
 	*next_send_at += 1.0 / send_rate;
-	if (*next_send_at + 1.0 < now_time) {
-		*next_send_at = now_time;
-	}
 	return 1;
 }
 
@@ -573,6 +611,8 @@ static void reap_tcp_connect_probes(tcp_connect_probe_t *probes,
 static int run_tcp_connect_sender(shard_t *s, double send_rate)
 {
 	int max_inflight = get_tcp_max_inflight();
+	double effective_rate = get_tcp_effective_rate(send_rate, max_inflight);
+	int launch_batch_cap = get_tcp_launch_batch_cap(effective_rate);
 	tcp_connect_probe_t *probes =
 	    xcalloc((size_t)max_inflight, sizeof(tcp_connect_probe_t));
 	struct pollfd *pfds =
@@ -595,9 +635,11 @@ static int run_tcp_connect_sender(shard_t *s, double send_rate)
 			shard_done = 1;
 		}
 		int launched_any = 0;
+		int launched_this_round = 0;
 		while (!stop_unprivileged_scan && !shard_done &&
 		       active_count < max_inflight &&
-		       tcp_launch_rate_ready(&next_send_at, send_rate)) {
+		       launched_this_round < launch_batch_cap &&
+		       tcp_launch_rate_ready(&next_send_at, effective_rate)) {
 			if (zconf.max_runtime &&
 			    zconf.max_runtime <= now() - zsend.start) {
 				shard_done = 1;
@@ -630,6 +672,7 @@ static int run_tcp_connect_sender(shard_t *s, double send_rate)
 			}
 			s->state.packets_sent++;
 			launched_any = 1;
+			launched_this_round++;
 
 			probe_num++;
 			if (probe_num >= zconf.probes_per_target) {
