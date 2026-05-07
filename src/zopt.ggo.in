@@ -103,6 +103,8 @@ option "interface"              i "Specify network interface to use"
     optional string
 option "iplayer"                X "Sends IP packets instead of Ethernet (for VPNs)"
     optional
+option "unprivileged"           - "Use ordinary sockets instead of raw sockets/pcap where possible. Supports non-root Linux/Termux for compatible probe modules."
+    optional
 option "netmap-wait-ping"       - "Wait for IP to respond to ping before commencing scan (netmap only)"
     typestr="ip"
     optional string

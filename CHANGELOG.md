@@ -1,3 +1,12 @@
+# Unreleased
+## FEATURE
+* Added an unprivileged Linux backend that falls back from raw sockets to ordinary TCP/UDP sockets for compatible probe modules.
+* Added `--unprivileged` and automatic fallback behavior for non-root environments such as Termux when raw sockets are unavailable.
+
+## NOTES
+* The unprivileged backend keeps ZMap's iteration, sharding, filtering, and output pipeline, but it does not preserve every raw-packet or libpcap behavior.
+* Probe modules that require custom raw packet transmission or passive capture still require the privileged backend.
+
 # 1.0.0 2013-8-16
 * Initial public release.
 

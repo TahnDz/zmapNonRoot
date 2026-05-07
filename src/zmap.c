@@ -16,6 +16,7 @@
 #include <sched.h>
 #include <errno.h>
 #include <pwd.h>
+#include <sys/socket.h>
 #include <time.h>
 
 #include <pcap/pcap.h>
@@ -44,6 +45,7 @@
 #include "get_gateway.h"
 #include "filter.h"
 #include "summary.h"
+#include "unprivileged.h"
 #include "utility.h"
 
 #include "output_modules/output_modules.h"
@@ -160,6 +162,19 @@ static void network_config_init(void)
 		    "no source IP address given. will use default address: %s.",
 		    inet_ntoa(default_ip));
 	}
+	if (zconf.unprivileged) {
+		if (!zconf.gw_mac_set) {
+			memset(zconf.gw_mac, 0, MAC_ADDR_LEN);
+			zconf.gw_mac_set = 1;
+		}
+		if (!zconf.hw_mac_set) {
+			memset(zconf.hw_mac, 0, MAC_ADDR_LEN);
+			zconf.hw_mac_set = 1;
+		}
+		log_info("zmap",
+			 "using unprivileged network backend; skipping gateway/MAC discovery");
+		return;
+	}
 	if (!zconf.gw_mac_set) {
 		struct in_addr gw_ip;
 		memset(&gw_ip, 0, sizeof(struct in_addr));
@@ -192,6 +207,52 @@ static void network_config_init(void)
 		  zconf.gw_mac[3], zconf.gw_mac[4], zconf.gw_mac[5]);
 }
 
+static int privileged_backend_available(void)
+{
+#if defined(PFRING) || defined(NETMAP)
+	return 1;
+#elif defined(__linux__)
+	int fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+	if (fd >= 0) {
+		close(fd);
+		return 1;
+	}
+	if (errno == EPERM || errno == EACCES) {
+		return 0;
+	}
+	log_debug("zmap", "raw socket probe failed: %s", strerror(errno));
+	return 0;
+#else
+	return 1;
+#endif
+}
+
+static void maybe_enable_unprivileged_mode(void)
+{
+	if (zconf.dryrun) {
+		return;
+	}
+	if (zconf.unprivileged) {
+		if (!unprivileged_module_supported()) {
+			log_fatal("zmap",
+				  "probe module (%s) is not supported by the unprivileged backend",
+				  zconf.probe_module->name);
+		}
+		return;
+	}
+	if (privileged_backend_available()) {
+		return;
+	}
+	if (!unprivileged_module_supported()) {
+		log_fatal("zmap",
+			  "raw sockets are unavailable and probe module (%s) is not supported by the unprivileged backend",
+			  zconf.probe_module->name);
+	}
+	zconf.unprivileged = 1;
+	log_info("zmap",
+		 "raw sockets are unavailable; falling back to the unprivileged backend");
+}
+
 static void start_zmap(void)
 {
 	// Initialization
@@ -217,6 +278,10 @@ static void start_zmap(void)
 	if (zconf.fast_dryrun) {
 		// fast dryrun mode is a special case of dryrun mode
 		zconf.dryrun = 1;
+	}
+	if (zconf.unprivileged && !zconf.dryrun) {
+		start_unprivileged_scan(it);
+		return;
 	}
 
 	// start threads
@@ -572,6 +637,7 @@ int main(int argc, char *argv[])
 	SET_BOOL(zconf.dryrun, dryrun);
 	SET_BOOL(zconf.fast_dryrun, fast_dryrun);
 	SET_BOOL(zconf.quiet, quiet);
+	SET_BOOL(zconf.unprivileged, unprivileged);
 	SET_BOOL(zconf.no_header_row, no_header_row);
 	zconf.cooldown_secs = args.cooldown_time_arg;
 	SET_IF_GIVEN(zconf.output_filename, output_file);
@@ -954,6 +1020,8 @@ int main(int argc, char *argv[])
 	} else if (args.batch_given) {
 		log_fatal("zmap", "batch size must be > 0 and <= 65535");
 	}
+
+	maybe_enable_unprivileged_mode();
 
 	if (args.max_targets_given) {
 		zconf.max_targets = parse_max_targets(args.max_targets_arg, zconf.ports->port_count);

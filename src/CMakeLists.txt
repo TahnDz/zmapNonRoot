@@ -52,6 +52,7 @@ set(SOURCES
     socket.c
     state.c
     summary.c
+    unprivileged.c
     utility.c
     validate.c
     zmap.c
@@ -81,6 +82,7 @@ set(ZTESTSOURCES
     socket.c
     state.c
     summary.c
+    unprivileged.c
     utility.c
     validate.c
     ztopt_compat.c

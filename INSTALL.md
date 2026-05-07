@@ -29,6 +29,8 @@ ZMap has the following dependencies:
   - [pkg-config](https://www.freedesktop.org/wiki/Software/pkg-config/) - compiler and library helper tool
   - [libjudy](https://judy.sourceforge.net/) - Judy Array for packet de-duplication
 
+The source tree now contains an unprivileged runtime backend for compatible probe modules on Linux and Android/Termux, but the build dependencies are unchanged. The privileged backend is still built and remains the only option for modules that require raw packet transmission or libpcap capture.
+
 Install the required dependencies with the following commands.
 
 * On Debian-based systems (including Ubuntu):
@@ -79,6 +81,16 @@ Then, ZMap can be compiled by running:
   ```
 
 and then installed via `sudo make install`.
+
+### Running without root on Linux or Termux
+
+When raw sockets are unavailable, ZMap will automatically fall back to `--unprivileged` for compatible probe modules. You can also request that path explicitly:
+
+```sh
+zmap --unprivileged -p 80
+```
+
+This mode is designed for environments such as Termux and other non-root Linux setups. It currently supports `tcp_synscan` and compatible UDP modules such as `udp`, `dns`, `ntp`, `upnp`, and `bacnet`. It does not preserve all raw-packet semantics and cannot replace the privileged backend for modules that depend on custom packet injection or passive packet capture.
 
 ### Development Notes
 

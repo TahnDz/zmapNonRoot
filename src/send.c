@@ -127,8 +127,16 @@ iterator_t *send_init(void)
 	}
 
 	// Get the source hardware address, and give it to the probe
-	// module
-	if (!zconf.hw_mac_set) {
+	// module. The unprivileged backend does not transmit Ethernet frames,
+	// so zero MAC addresses are sufficient there.
+	if (zconf.unprivileged) {
+		if (!zconf.hw_mac_set) {
+			memset(zconf.hw_mac, 0, sizeof(zconf.hw_mac));
+		}
+		if (!zconf.gw_mac_set) {
+			memset(zconf.gw_mac, 0, sizeof(zconf.gw_mac));
+		}
+	} else if (!zconf.hw_mac_set) {
 		if (get_iface_hw_addr(zconf.iface, zconf.hw_mac)) {
 			log_fatal(
 			    "send",

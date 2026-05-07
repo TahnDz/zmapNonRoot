@@ -125,6 +125,7 @@ struct state_conf {
 	int dryrun;
 	int fast_dryrun;
 	int quiet;
+	int unprivileged;
 	int ignore_invalid_hosts;
 	int syslog;
 	int recv_ready;
