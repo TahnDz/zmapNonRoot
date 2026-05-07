@@ -11,6 +11,21 @@ option(WITH_NETMAP "Build with netmap(4) for send/recv (10+ GigE)" OFF)
 option(WITH_AES_HW "Build with AES hardware acceleration (x86_64 and arm64)" OFF)
 option(FORCE_CONF_INSTALL "Overwrites existing configuration files at install" OFF)
 
+if(RESPECT_INSTALL_PREFIX_CONFIG)
+    set(CONFIG_DESTINATION "etc/zmap")
+else()
+    set(CONFIG_DESTINATION "/etc/zmap")
+endif()
+
+if(IS_ABSOLUTE "${CONFIG_DESTINATION}")
+    set(ZMAP_CONFIG_PATH "${CONFIG_DESTINATION}")
+else()
+    set(ZMAP_CONFIG_PATH "${CMAKE_INSTALL_PREFIX}/${CONFIG_DESTINATION}")
+endif()
+set(ZMAP_DEFAULT_BLOCKLIST_PATH "${ZMAP_CONFIG_PATH}/blocklist.conf")
+set(ZMAP_DEFAULT_CONFIG_FILE "${ZMAP_CONFIG_PATH}/zmap.conf")
+add_definitions(-DZMAP_DEFAULT_BLOCKLIST=\"${ZMAP_DEFAULT_BLOCKLIST_PATH}\")
+
 if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
     set(USING_CLANG "YES")
 else()
@@ -180,13 +195,12 @@ add_subdirectory(lib)
 add_subdirectory(src)
 
 # Install conf files
-if(RESPECT_INSTALL_PREFIX_CONFIG)
-    set(CONFIG_DESTINATION "etc/zmap")
-else()
-    set(CONFIG_DESTINATION "/etc/zmap")
-endif()
+file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/conf")
+configure_file("${PROJECT_SOURCE_DIR}/conf/zmap.conf"
+               "${CMAKE_BINARY_DIR}/conf/zmap.conf" @ONLY)
 
 FILE(GLOB CONF_FILES "${PROJECT_SOURCE_DIR}/conf/*")
+list(REMOVE_ITEM CONF_FILES "${PROJECT_SOURCE_DIR}/conf/zmap.conf")
 
 # Upgrade path for old conf files - this is necessary for users upgrading from a version where we called the blocklist file blacklist.conf
 # Must occur before the install command
@@ -217,7 +231,8 @@ else()
     message(STATUS "No ZMap configuration file detected at ${CONFIG_DESTINATION}/zmap.conf. No changes necessary to upgrade ZMap configuration file.")
 endif()
 
-message(STATUS "Default ZMap configuration file location is /etc/zmap")
+message(STATUS "Default ZMap configuration file location is ${ZMAP_CONFIG_PATH}")
+install(FILES "${CMAKE_BINARY_DIR}/conf/zmap.conf" DESTINATION ${CONFIG_DESTINATION})
 foreach(EACH_CONF ${CONF_FILES})
     get_filename_component(CONF_BASENAME ${EACH_CONF} NAME)
     message(STATUS "Checking if ${CONF_BASENAME} exists there...")

@@ -340,6 +340,15 @@ int set_cpu(uint32_t core)
 
 #else
 
+#if defined(__ANDROID__)
+
+int set_cpu(UNUSED uint32_t core)
+{
+	return EXIT_SUCCESS;
+}
+
+#else
+
 #if defined(__FreeBSD__)
 #include <sys/param.h>
 #include <sys/cpuset.h>
@@ -359,6 +368,8 @@ int set_cpu(uint32_t core)
 	}
 	return EXIT_SUCCESS;
 }
+
+#endif
 
 #endif
 

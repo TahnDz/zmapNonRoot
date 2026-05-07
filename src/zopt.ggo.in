@@ -185,7 +185,7 @@ option "user-metadata"          - "Inject user-specified JSON metadata into scan
 section "Additional Options"
 option "config"                 C "Read a configuration file, which can specify any of these options"
     typestr="filename"
-    default="/etc/zmap/zmap.conf"
+    default="@ZMAP_DEFAULT_CONFIG_FILE@"
     optional string
 
 option "max-sendto-failures"    - "Maximum NIC sendto failures before scan is aborted"

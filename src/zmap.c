@@ -137,8 +137,63 @@ static void *start_mon(void *arg)
 	return NULL;
 }
 
+static int get_default_source_ip_unprivileged(struct in_addr *ip)
+{
+	int sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sock < 0) {
+		return -1;
+	}
+	struct sockaddr_in remote;
+	memset(&remote, 0, sizeof(remote));
+	remote.sin_family = AF_INET;
+	remote.sin_port = htons(53);
+	remote.sin_addr.s_addr = inet_addr("1.1.1.1");
+	if (connect(sock, (struct sockaddr *)&remote, sizeof(remote)) < 0) {
+		close(sock);
+		return -1;
+	}
+	struct sockaddr_in local;
+	memset(&local, 0, sizeof(local));
+	socklen_t len = sizeof(local);
+	if (getsockname(sock, (struct sockaddr *)&local, &len) < 0) {
+		close(sock);
+		return -1;
+	}
+	close(sock);
+	*ip = local.sin_addr;
+	return EXIT_SUCCESS;
+}
+
 static void network_config_init(void)
 {
+	if (zconf.unprivileged) {
+		if (zconf.number_source_ips == 0) {
+			struct in_addr default_ip;
+			if (get_default_source_ip_unprivileged(&default_ip) < 0) {
+				log_fatal("zmap",
+					  "could not detect a source address for the unprivileged backend. "
+					  "Try specifying one explicitly with -S.");
+			}
+			zconf.source_ip_addresses[0] = default_ip.s_addr;
+			zconf.number_source_ips++;
+			log_debug("zmap",
+				  "no source IP address given. will use default address: %s.",
+				  inet_ntoa(default_ip));
+		}
+		if (zconf.iface == NULL) {
+			log_info("zmap",
+				 "using unprivileged network backend without binding to a specific interface");
+		}
+		if (!zconf.gw_mac_set) {
+			memset(zconf.gw_mac, 0, MAC_ADDR_LEN);
+			zconf.gw_mac_set = 1;
+		}
+		if (!zconf.hw_mac_set) {
+			memset(zconf.hw_mac, 0, MAC_ADDR_LEN);
+			zconf.hw_mac_set = 1;
+		}
+		return;
+	}
 	if (zconf.iface == NULL) {
 		zconf.iface = get_default_iface();
 		assert(zconf.iface);
@@ -161,19 +216,6 @@ static void network_config_init(void)
 		    "zmap",
 		    "no source IP address given. will use default address: %s.",
 		    inet_ntoa(default_ip));
-	}
-	if (zconf.unprivileged) {
-		if (!zconf.gw_mac_set) {
-			memset(zconf.gw_mac, 0, MAC_ADDR_LEN);
-			zconf.gw_mac_set = 1;
-		}
-		if (!zconf.hw_mac_set) {
-			memset(zconf.hw_mac, 0, MAC_ADDR_LEN);
-			zconf.hw_mac_set = 1;
-		}
-		log_info("zmap",
-			 "using unprivileged network backend; skipping gateway/MAC discovery");
-		return;
 	}
 	if (!zconf.gw_mac_set) {
 		struct in_addr gw_ip;
