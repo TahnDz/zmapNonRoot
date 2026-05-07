@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -50,11 +51,25 @@ typedef struct unpriv_mon_arg {
 	pthread_mutex_t *lock;
 } unpriv_mon_arg_t;
 
+typedef struct tcp_connect_probe {
+	int fd;
+	uint32_t src_ip;
+	uint32_t dst_ip;
+	uint16_t dst_port;
+	uint16_t local_port;
+	double start_time;
+} tcp_connect_probe_t;
+
 static pthread_mutex_t output_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t recv_ready_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t **seen = NULL;
 static cachehash *ch = NULL;
 static volatile int stop_unprivileged_scan = 0;
+
+static void init_synthetic_ip(struct ip *ip, uint8_t proto, uint32_t src_ip,
+			      uint32_t dst_ip, uint16_t ip_len);
+static void finalize_fieldset(fieldset_t *fs, uint32_t src_ip,
+			      uint16_t src_port, const struct timespec ts);
 
 static unpriv_backend_t get_backend(void)
 {
@@ -102,6 +117,21 @@ static void add_tcp_result_fields(fieldset_t *fs, uint16_t remote_port,
 			 is_success ? "synack" : "rst");
 	fs_add_bool(fs, "success", is_success);
 	fs_add_null_icmp(fs);
+}
+
+static void emit_tcp_connect_result(uint32_t src_ip, uint32_t dst_ip,
+					    uint16_t dst_port,
+					    uint16_t local_port,
+					    int is_success,
+					    const struct timespec ts)
+{
+	fieldset_t *fs = fs_new_fieldset(&zconf.fsconf.defs);
+	struct ip ip;
+	init_synthetic_ip(&ip, IPPROTO_TCP, dst_ip, src_ip, sizeof(struct ip));
+	fs_add_ip_fields(fs, &ip);
+	add_tcp_result_fields(fs, dst_port, local_port, is_success);
+	finalize_fieldset(fs, dst_ip, dst_port, ts);
+	fs_free(fs);
 }
 
 static void init_synthetic_ip(struct ip *ip, uint8_t proto, uint32_t src_ip,
@@ -222,16 +252,6 @@ static void finalize_fieldset(fieldset_t *fs, uint32_t src_ip,
 	pthread_mutex_unlock(&output_mutex);
 }
 
-static int wait_for_fd(int fd, short events, int timeout_ms)
-{
-	struct pollfd pfd = {.fd = fd, .events = events, .revents = 0};
-	int ret;
-	do {
-		ret = poll(&pfd, 1, timeout_ms);
-	} while (ret < 0 && errno == EINTR);
-	return ret;
-}
-
 static int set_nonblocking(int fd)
 {
 	int flags = fcntl(fd, F_GETFL, 0);
@@ -239,6 +259,146 @@ static int set_nonblocking(int fd)
 		return -1;
 	}
 	return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static int get_tcp_max_inflight(void)
+{
+	struct rlimit lim;
+	rlim_t soft_limit = 1024;
+	if (getrlimit(RLIMIT_NOFILE, &lim) == 0 && lim.rlim_cur > 0) {
+		soft_limit = lim.rlim_cur;
+	}
+	rlim_t reserve = 64;
+	rlim_t per_thread = soft_limit / zconf.senders;
+	if (per_thread <= reserve) {
+		return 64;
+	}
+	per_thread -= reserve;
+	if (per_thread > 16384) {
+		per_thread = 16384;
+	}
+	if (per_thread < 64) {
+		per_thread = 64;
+	}
+	return (int)per_thread;
+}
+
+static int time_until_next_send_ms(double next_send_at)
+{
+	double now_time = steady_now();
+	if (next_send_at <= 0.0 || next_send_at <= now_time) {
+		return 0;
+	}
+	double remaining = next_send_at - now_time;
+	int timeout_ms = (int)(remaining * 1000.0);
+	if (timeout_ms < 0) {
+		return 0;
+	}
+	if (timeout_ms > UNPRIVILEGED_TIMEOUT_MS) {
+		timeout_ms = UNPRIVILEGED_TIMEOUT_MS;
+	}
+	return timeout_ms;
+}
+
+static int compute_tcp_poll_timeout(const tcp_connect_probe_t *probes,
+					    int max_inflight,
+					    int launches_pending,
+					    double next_send_at)
+{
+	int timeout_ms = launches_pending ? time_until_next_send_ms(next_send_at)
+					  : UNPRIVILEGED_TIMEOUT_MS;
+	double now_time = steady_now();
+	for (int i = 0; i < max_inflight; i++) {
+		if (probes[i].fd < 0) {
+			continue;
+		}
+		double age = now_time - probes[i].start_time;
+		int remaining =
+		    UNPRIVILEGED_TIMEOUT_MS - (int)(age * 1000.0);
+		if (remaining < 0) {
+			remaining = 0;
+		}
+		if (remaining < timeout_ms) {
+			timeout_ms = remaining;
+		}
+	}
+	return timeout_ms;
+}
+
+static int tcp_target_allowed(target_t current)
+{
+	return !zconf.list_of_ips_filename ||
+	       pbm_check(zsend.list_of_ips_pbm, current.ip);
+}
+
+static target_t next_allowed_target(shard_t *s, target_t current)
+{
+	while (current.status != ZMAP_SHARD_DONE && !tcp_target_allowed(current)) {
+		current = shard_get_next_target(s);
+	}
+	return current;
+}
+
+static int tcp_launch_rate_ready(double *next_send_at, double send_rate)
+{
+	if (send_rate <= 0) {
+		return 1;
+	}
+	double now_time = steady_now();
+	if (*next_send_at <= 0.0) {
+		*next_send_at = now_time;
+	}
+	if (now_time + 0.000001 < *next_send_at) {
+		return 0;
+	}
+	*next_send_at += 1.0 / send_rate;
+	if (*next_send_at + 1.0 < now_time) {
+		*next_send_at = now_time;
+	}
+	return 1;
+}
+
+static int get_local_socket_port(int fd, uint16_t *port)
+{
+	struct sockaddr_in local;
+	socklen_t local_len = sizeof(local);
+	if (getsockname(fd, (struct sockaddr *)&local, &local_len) < 0) {
+		return -1;
+	}
+	*port = ntohs(local.sin_port);
+	return 0;
+}
+
+static void close_tcp_probe(tcp_connect_probe_t *probe, struct pollfd *pfd)
+{
+	if (probe->fd >= 0) {
+		close(probe->fd);
+	}
+	probe->fd = -1;
+	pfd->fd = -1;
+	pfd->events = 0;
+	pfd->revents = 0;
+}
+
+static int finalize_tcp_probe(tcp_connect_probe_t *probe, struct pollfd *pfd,
+				      int connect_errno)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	if (connect_errno == 0 || connect_errno == EISCONN) {
+		emit_tcp_connect_result(probe->src_ip, probe->dst_ip,
+					probe->dst_port, probe->local_port, 1,
+					ts);
+	} else if (connect_errno == ECONNREFUSED) {
+		emit_tcp_connect_result(probe->src_ip, probe->dst_ip,
+					probe->dst_port, probe->local_port, 0,
+					ts);
+	}
+	close_tcp_probe(probe, pfd);
+	return (connect_errno == 0 || connect_errno == EISCONN ||
+		connect_errno == ECONNREFUSED || connect_errno == ETIMEDOUT)
+		   ? 0
+		   : -1;
 }
 
 static void wait_for_rate(double send_rate, double *next_send_at)
@@ -309,9 +469,11 @@ static void synthesize_udp_icmp_unreach(uint8_t *packet, size_t *packet_len,
 	*packet_len = sizeof(struct ether_header) + outer_ip_len;
 }
 
-static int run_tcp_connect_probe(uint32_t src_ip, uint32_t dst_ip,
-				 uint16_t dst_port, int probe_num,
-				 uint32_t *validation)
+static int launch_tcp_connect_probe(tcp_connect_probe_t *probe,
+					    struct pollfd *pfd,
+					    uint32_t src_ip,
+					    uint32_t dst_ip,
+					    uint16_t dst_port)
 {
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) {
@@ -319,13 +481,14 @@ static int run_tcp_connect_probe(uint32_t src_ip, uint32_t dst_ip,
 	}
 	struct linger linger = {.l_onoff = 1, .l_linger = 0};
 	(void)setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger));
+#ifdef TCP_SYNCNT
+	int syn_retries = 1;
+	(void)setsockopt(fd, IPPROTO_TCP, TCP_SYNCNT, &syn_retries,
+			 sizeof(syn_retries));
+#endif
 
-	uint16_t num_source_ports =
-	    zconf.source_port_last - zconf.source_port_first + 1;
-	uint16_t local_port =
-	    get_src_port(num_source_ports, probe_num, validation);
 	struct sockaddr_in local = {.sin_family = AF_INET,
-				    .sin_port = htons(local_port),
+				    .sin_port = 0,
 				    .sin_addr.s_addr = src_ip};
 	if (bind(fd, (struct sockaddr *)&local, sizeof(local)) < 0) {
 		close(fd);
@@ -342,44 +505,169 @@ static int run_tcp_connect_probe(uint32_t src_ip, uint32_t dst_ip,
 	int connect_errno = 0;
 	if (rc < 0) {
 		connect_errno = errno;
-		if (connect_errno == EINPROGRESS) {
-			rc = wait_for_fd(fd, POLLOUT, UNPRIVILEGED_TIMEOUT_MS);
-			if (rc > 0) {
-				socklen_t optlen = sizeof(connect_errno);
-				if (getsockopt(fd, SOL_SOCKET, SO_ERROR,
-					       &connect_errno, &optlen) < 0) {
-					connect_errno = errno;
-				}
-			} else if (rc == 0) {
-				connect_errno = ETIMEDOUT;
-			} else {
-				connect_errno = errno;
-			}
-		}
 	} else {
 		connect_errno = 0;
 	}
+	uint16_t local_port = 0;
+	if (get_local_socket_port(fd, &local_port) < 0) {
+		close(fd);
+		return -1;
+	}
 
-	if (connect_errno == 0 || connect_errno == EISCONN ||
-	    connect_errno == ECONNREFUSED) {
-		struct timespec ts;
-		clock_gettime(CLOCK_REALTIME, &ts);
-		fieldset_t *fs = fs_new_fieldset(&zconf.fsconf.defs);
-		struct ip ip;
-		init_synthetic_ip(&ip, IPPROTO_TCP, dst_ip, src_ip,
-				  sizeof(struct ip));
-		fs_add_ip_fields(fs, &ip);
-		add_tcp_result_fields(fs, dst_port, local_port,
-				      connect_errno == 0 || connect_errno == EISCONN);
-		finalize_fieldset(fs, dst_ip, dst_port, ts);
-		fs_free(fs);
+	probe->fd = fd;
+	probe->src_ip = src_ip;
+	probe->dst_ip = dst_ip;
+	probe->dst_port = dst_port;
+	probe->local_port = local_port;
+	probe->start_time = steady_now();
+	pfd->fd = fd;
+	pfd->events = POLLOUT | POLLERR | POLLHUP;
+	pfd->revents = 0;
+
+	if (connect_errno == EINPROGRESS || connect_errno == EALREADY ||
+	    connect_errno == EWOULDBLOCK) {
+		return 1;
 	}
-	close(fd);
-	if (connect_errno == 0 || connect_errno == EISCONN ||
-	    connect_errno == ECONNREFUSED || connect_errno == ETIMEDOUT) {
-		return 0;
+	return finalize_tcp_probe(probe, pfd, connect_errno);
+}
+
+static void reap_tcp_connect_probes(tcp_connect_probe_t *probes,
+					    struct pollfd *pfds,
+					    int max_inflight,
+					    int launches_pending,
+					    double next_send_at,
+					    uint32_t *local_failures)
+{
+	int timeout_ms = compute_tcp_poll_timeout(probes, max_inflight,
+						 launches_pending,
+						 next_send_at);
+	int ret;
+	do {
+		ret = poll(pfds, (nfds_t)max_inflight, timeout_ms);
+	} while (ret < 0 && errno == EINTR);
+	double now_time = steady_now();
+	for (int i = 0; i < max_inflight; i++) {
+		if (probes[i].fd < 0) {
+			continue;
+		}
+		int connect_errno = -1;
+		if (pfds[i].revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL)) {
+			socklen_t optlen = sizeof(connect_errno);
+			if (getsockopt(probes[i].fd, SOL_SOCKET, SO_ERROR,
+				       &connect_errno, &optlen) < 0) {
+				connect_errno = errno;
+			}
+		} else if ((now_time - probes[i].start_time) * 1000.0 >=
+			   UNPRIVILEGED_TIMEOUT_MS) {
+			connect_errno = ETIMEDOUT;
+		}
+		if (connect_errno == -1) {
+			continue;
+		}
+		if (finalize_tcp_probe(&probes[i], &pfds[i], connect_errno) < 0) {
+			(*local_failures)++;
+		}
 	}
-	return -1;
+}
+
+static int run_tcp_connect_sender(shard_t *s, double send_rate)
+{
+	int max_inflight = get_tcp_max_inflight();
+	tcp_connect_probe_t *probes =
+	    xcalloc((size_t)max_inflight, sizeof(tcp_connect_probe_t));
+	struct pollfd *pfds =
+	    xcalloc((size_t)max_inflight, sizeof(struct pollfd));
+	for (int i = 0; i < max_inflight; i++) {
+		probes[i].fd = -1;
+		pfds[i].fd = -1;
+	}
+
+	double next_send_at = 0.0;
+	target_t current = next_allowed_target(s, shard_get_cur_target(s));
+	int probe_num = 0;
+	int shard_done = (current.status == ZMAP_SHARD_DONE);
+	int active_count = 0;
+
+	while (!stop_unprivileged_scan &&
+	       (!shard_done || active_count > 0)) {
+		if (!shard_done && zconf.max_runtime &&
+		    zconf.max_runtime <= now() - zsend.start) {
+			shard_done = 1;
+		}
+		int launched_any = 0;
+		while (!stop_unprivileged_scan && !shard_done &&
+		       active_count < max_inflight &&
+		       tcp_launch_rate_ready(&next_send_at, send_rate)) {
+			if (zconf.max_runtime &&
+			    zconf.max_runtime <= now() - zsend.start) {
+				shard_done = 1;
+				break;
+			}
+			if (s->state.max_targets &&
+			    s->state.targets_scanned >= s->state.max_targets) {
+				shard_done = 1;
+				break;
+			}
+			int slot = -1;
+			for (int i = 0; i < max_inflight; i++) {
+				if (probes[i].fd < 0) {
+					slot = i;
+					break;
+				}
+			}
+			if (slot < 0) {
+				break;
+			}
+			uint32_t src_ip =
+			    get_src_ip_unprivileged(current.ip, probe_num);
+			int rc = launch_tcp_connect_probe(&probes[slot], &pfds[slot],
+							  src_ip, current.ip,
+							  current.port);
+			if (rc < 0) {
+				s->state.packets_failed++;
+			} else if (rc > 0) {
+				active_count++;
+			}
+			s->state.packets_sent++;
+			launched_any = 1;
+
+			probe_num++;
+			if (probe_num >= zconf.probes_per_target) {
+				probe_num = 0;
+				s->state.targets_scanned++;
+				current = next_allowed_target(
+				    s, shard_get_next_target(s));
+				shard_done = (current.status == ZMAP_SHARD_DONE);
+			}
+		}
+		if (active_count > 0) {
+			reap_tcp_connect_probes(probes, pfds, max_inflight,
+						(!shard_done &&
+						 active_count < max_inflight),
+						next_send_at,
+						&s->state.packets_failed);
+			active_count = 0;
+			for (int i = 0; i < max_inflight; i++) {
+				if (probes[i].fd >= 0) {
+					active_count++;
+				}
+			}
+		} else if (!launched_any && !shard_done) {
+			int timeout_ms = time_until_next_send_ms(next_send_at);
+			if (timeout_ms > 0) {
+				poll(NULL, 0, timeout_ms);
+			}
+		}
+	}
+
+	for (int i = 0; i < max_inflight; i++) {
+		if (probes[i].fd >= 0) {
+			close_tcp_probe(&probes[i], &pfds[i]);
+		}
+	}
+	free(probes);
+	free(pfds);
+	return EXIT_SUCCESS;
 }
 
 static int run_udp_probe(uint32_t src_ip, uint32_t dst_ip, uint16_t dst_port,
@@ -488,6 +776,12 @@ static int run_udp_probe(uint32_t src_ip, uint32_t dst_ip, uint16_t dst_port,
 static int run_unprivileged_sender(shard_t *s)
 {
 	unpriv_backend_t backend = get_backend();
+	double send_rate = (double)zconf.rate / (double)zconf.senders;
+	int ret = EXIT_SUCCESS;
+	if (backend == UNPRIV_BACKEND_TCP_CONNECT) {
+		ret = run_tcp_connect_sender(s, send_rate);
+		goto cleanup;
+	}
 	void *probe_data = NULL;
 	uint8_t packet_template[MAX_PACKET_SIZE];
 	memset(packet_template, 0, sizeof(packet_template));
@@ -507,7 +801,6 @@ static int run_unprivileged_sender(shard_t *s)
 	}
 
 	double next_send_at = 0.0;
-	double send_rate = (double)zconf.rate / (double)zconf.senders;
 	target_t current = shard_get_cur_target(s);
 	uint32_t current_ip = current.ip;
 	uint16_t current_port = current.port;
@@ -552,12 +845,7 @@ static int run_unprivileged_sender(shard_t *s)
 			    (uint16_t)(validation[validation_words - 1] & 0xFFFF);
 
 			int rc = 0;
-			if (backend == UNPRIV_BACKEND_TCP_CONNECT) {
-				rc = run_tcp_connect_probe(src_ip, current_ip,
-							   current_port,
-							   probe_num,
-							   validation);
-			} else if (backend == UNPRIV_BACKEND_UDP) {
+			if (backend == UNPRIV_BACKEND_UDP) {
 				rc = run_udp_probe(src_ip, current_ip,
 						   current_port, probe_num,
 						   validation, ip_id,
@@ -590,7 +878,7 @@ static int run_unprivileged_sender(shard_t *s)
 
 cleanup:
 	s->cb(s->thread_id, s->arg);
-	return EXIT_SUCCESS;
+	return ret;
 }
 
 static void *start_unprivileged_sender(void *arg)

@@ -1,4 +1,8 @@
 # Unreleased
+## BUGFIX
+* Reworked unprivileged `tcp_synscan` to use asynchronous nonblocking TCP connects instead of one blocking connect per target, which restores practical send rates for non-root Linux and Termux runs.
+* Stopped launching new unprivileged TCP probes after `--max-runtime` expires while still draining in-flight sockets, and fixed sender completion so `--unprivileged` scans exit cleanly after reporting progress/results.
+
 ## FEATURE
 * Added an unprivileged Linux backend that falls back from raw sockets to ordinary TCP/UDP sockets for compatible probe modules.
 * Added `--unprivileged` and automatic fallback behavior for non-root environments such as Termux when raw sockets are unavailable.
