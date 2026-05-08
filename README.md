@@ -53,7 +53,7 @@ On Linux systems without `root` or `CAP_NET_RAW`, ZMap can now fall back to an u
 
 The unprivileged backend currently supports `tcp_synscan` plus UDP-based modules that can be driven over ordinary datagram sockets, including `udp`, `dns`, `ntp`, `upnp`, and `bacnet`. It preserves ZMap's target iteration, output modules, filters, sharding, and rate controls, but it does not preserve every raw-packet behavior. Modules that require custom Ethernet/IP packet transmission or passive packet capture still require the privileged backend.
 
-For user-local source builds on Termux or non-root Linux, use `sh scripts/bootstrap-env.sh`, `sh scripts/build.sh`, and `sh scripts/install-local.sh`. They default to installing under `$HOME/.local/zmap` and do not assume `sudo` or `apt`.
+For user-local source builds on Termux or non-root Linux, use `sh scripts/setup-local.sh`. It validates the environment, builds, and installs without assuming `sudo` or `apt`. On Termux it automatically uses `$PREFIX` as the dependency prefix, so installed packages are discovered without extra exports.
 
 If you haven't used ZMap before, we have a step-by-step [Getting Started Guide](https://github.com/zmap/zmap/wiki/Getting-Started-Guide) that details how to perform basic scans. Documentation about all of ZMap's options and more advanced functionality can be found in our [Wiki](https://github.com/zmap/zmap/wiki). For best practices, see [Scanning Best Practices](https://github.com/zmap/zmap/wiki/Scanning-Best-Practices). 
 

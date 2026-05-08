@@ -83,7 +83,14 @@ Then, ZMap can be compiled by running:
 and then installed via `sudo make install`.
 
 For a user-local build that does not assume `sudo`, `apt`, or any system-wide
-install location, use the helper scripts in `scripts/`:
+install location, use the single entrypoint below:
+
+```sh
+sh scripts/setup-local.sh
+```
+
+The older helper scripts remain available if you want to run each phase
+manually:
 
 ```sh
 sh scripts/bootstrap-env.sh
@@ -91,23 +98,29 @@ sh scripts/build.sh
 sh scripts/install-local.sh
 ```
 
-By default these build in `$HOME/build-zmap`, install into `$HOME/.local/zmap`,
-and also search `$HOME/.local` for locally installed headers, libraries,
-pkg-config files, and tools. You can override the paths with:
+By default the new wrapper builds in `$HOME/build-zmap`, installs into
+`$HOME/.local/zmap`, and searches a user-local dependency prefix for headers,
+libraries, pkg-config files, and build tools. On Termux it uses `$PREFIX` as the
+default dependency prefix automatically. You can override the paths with:
 
 ```sh
 ZMAP_DEPS_PREFIX=$HOME/.local \
 ZMAP_BUILD_DIR=$HOME/build-zmap \
 ZMAP_INSTALL_PREFIX=$HOME/.local/zmap \
-sh scripts/build.sh
+sh scripts/setup-local.sh build
 
 ZMAP_BUILD_DIR=$HOME/build-zmap \
 ZMAP_INSTALL_PREFIX=$HOME/.local/zmap \
-sh scripts/install-local.sh
+sh scripts/setup-local.sh install
 ```
 
 This flow is intended for Termux and other non-root Linux environments where
-dependencies are already available under a user-owned prefix.
+dependencies are already available under a user-owned prefix. To inspect the
+resolved prefixes without building, run:
+
+```sh
+sh scripts/setup-local.sh env
+```
 
 ### Running without root on Linux or Termux
 
