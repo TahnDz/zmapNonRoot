@@ -32,10 +32,10 @@
 #include "state.h"
 #include "validate.h"
 
-#define UNPRIVILEGED_TIMEOUT_MS 1000
+#define UNPRIVILEGED_TIMEOUT_MS 200
 #define TCP_CONNECT_PACING_SLICE_MS 10
-#define TCP_CONNECT_MAX_LAUNCH_BATCH 256
-#define TCP_CONNECT_MAX_RATE_LAG_PACKETS 32.0
+#define TCP_CONNECT_MAX_LAUNCH_BATCH 8192
+#define TCP_CONNECT_MAX_RATE_LAG_PACKETS 1024.0
 
 typedef enum {
 	UNPRIV_BACKEND_UNSUPPORTED = 0,
@@ -268,20 +268,15 @@ static int get_tcp_max_inflight(void)
 {
 	struct rlimit lim;
 	rlim_t soft_limit = 1024;
-	if (getrlimit(RLIMIT_NOFILE, &lim) == 0 && lim.rlim_cur > 0) {
-		soft_limit = lim.rlim_cur;
+	if (getrlimit(RLIMIT_NOFILE, &lim) == 0) {
+		soft_limit = (lim.rlim_cur > 0) ? lim.rlim_cur : lim.rlim_max;
 	}
-	rlim_t reserve = 64;
-	rlim_t per_thread = soft_limit / zconf.senders;
-	if (per_thread <= reserve) {
+	rlim_t per_thread = (soft_limit * 3) / 4 / zconf.senders;
+	if (per_thread <= 64) {
 		return 64;
 	}
-	per_thread -= reserve;
-	if (per_thread > 16384) {
-		per_thread = 16384;
-	}
-	if (per_thread < 64) {
-		per_thread = 64;
+	if (per_thread > 65536) {
+		per_thread = 65536;
 	}
 	return (int)per_thread;
 }
@@ -293,7 +288,7 @@ static double get_tcp_effective_rate(double send_rate, int max_inflight)
 	if (max_rate < 1.0) {
 		max_rate = 1.0;
 	}
-	if (send_rate <= 0.0 || send_rate > max_rate) {
+	if (send_rate <= 0.0) {
 		return max_rate;
 	}
 	return send_rate;
@@ -407,9 +402,17 @@ static int get_local_socket_port(int fd, uint16_t *port)
 	return 0;
 }
 
+// Send RST on close to avoid TIME_WAIT (60s), freeing the port immediately.
+static void set_no_timewait(int fd)
+{
+	struct linger ling = {.l_onoff = 1, .l_linger = 0};
+	setsockopt(fd, SOL_SOCKET, SO_LINGER, &ling, sizeof(ling));
+}
+
 static void close_tcp_probe(tcp_connect_probe_t *probe, struct pollfd *pfd)
 {
 	if (probe->fd >= 0) {
+		set_no_timewait(probe->fd);
 		close(probe->fd);
 	}
 	probe->fd = -1;
@@ -517,22 +520,35 @@ static int launch_tcp_connect_probe(tcp_connect_probe_t *probe,
 	if (fd < 0) {
 		return -1;
 	}
-	struct linger linger = {.l_onoff = 1, .l_linger = 0};
-	(void)setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger, sizeof(linger));
+	// SO_REUSEADDR allows rebinding to the same source IP/port quickly
+	int reuse = 1;
+	(void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+	// SO_LINGER with linger=0 sends RST on close -> no 60s TIME_WAIT
+	set_no_timewait(fd);
+	// Boost buffers for high-throughput scanning
+	int sndbuf = 1024 * 1024;
+	int rcvbuf = 512 * 1024;
+	(void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+	(void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 #ifdef TCP_SYNCNT
 	int syn_retries = 1;
 	(void)setsockopt(fd, IPPROTO_TCP, TCP_SYNCNT, &syn_retries,
 			 sizeof(syn_retries));
 #endif
+	// TCP_NODELAY disables Nagle coalescing -> send immediately
+	int nodelay = 1;
+	(void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
 	struct sockaddr_in local = {.sin_family = AF_INET,
 				    .sin_port = 0,
 				    .sin_addr.s_addr = src_ip};
 	if (bind(fd, (struct sockaddr *)&local, sizeof(local)) < 0) {
+		set_no_timewait(fd);
 		close(fd);
 		return -1;
 	}
 	if (set_nonblocking(fd) < 0) {
+		set_no_timewait(fd);
 		close(fd);
 		return -1;
 	}
@@ -547,9 +563,9 @@ static int launch_tcp_connect_probe(tcp_connect_probe_t *probe,
 		connect_errno = 0;
 	}
 	uint16_t local_port = 0;
+	// Graceful: if getsockname fails, use port=0 and continue
 	if (get_local_socket_port(fd, &local_port) < 0) {
-		close(fd);
-		return -1;
+		local_port = 0;
 	}
 
 	probe->fd = fd;
